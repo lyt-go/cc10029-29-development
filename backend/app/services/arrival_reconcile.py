@@ -41,6 +41,95 @@ class ArrivalReconcileService(BaseModuleService):
         return {"recon_code": recon_code, "recon_id": entry["id"], "batch_code": batch_code,
                 "expected_count": expected_count}
 
+    def reconcile_manifest(self, manifest_code: str) -> dict[str, Any]:
+        """据成组发布清单执行整组对账，区分已抵达窗口与尚待补齐窗口。
+
+        对账以发布清单为唯一事实来源：逐窗口比对清单应到行数与暂存实际落地产物，
+        已交付且行数齐的窗口判为已抵达，其余判为待补齐，并回写每个成员的对账值。
+        """
+        from app.services.release_manifest import ReleaseManifestService
+        from app.services.staging_area import StagingAreaService
+
+        release_svc = ReleaseManifestService()
+        manifest = release_svc.get_manifest(manifest_code)
+        if manifest is None:
+            return {"error": f"发布清单 {manifest_code} 不存在", "message": "发布清单不存在"}
+
+        staging_scope = StagingAreaService().staging_scope(manifest_code)
+        staging_by_window = {
+            item["window_code"]: item for item in staging_scope.get("members", [])
+        }
+        rows = store.rows(self.MODULE)
+        arrived, waiting, member_results = [], [], []
+        for member in manifest.get("members", []):
+            window_code = member.get("window_code")
+            expected = int(member.get("expected_rows") or 0)
+            staging = staging_by_window.get(window_code, {})
+            actual = int(staging.get("staging_rows") or 0)
+            missing = max(0, expected - actual)
+            balanced = (
+                member.get("delivery_status") == "已交付"
+                and expected > 0
+                and actual >= expected
+            )
+            recon_code = member.get("reconcile_code") or f"ARRI-{member.get('transfer_batch')}"
+            recon_row = next((row for row in rows if row.get("对账编号") == recon_code), None)
+            if recon_row is None and recon_code:
+                recon_row = {
+                    "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+                    "对账编号": recon_code,
+                    "批次编号": member.get("transfer_batch"),
+                    "对账窗口": "成组发布",
+                    "pending": True,
+                    "abnormal": False,
+                }
+                rows.append(recon_row)
+            if recon_row is not None:
+                recon_row.update({
+                    "应到条数": str(expected),
+                    "实到条数": str(actual),
+                    "迟到条数": "0",
+                    "缺失条数": str(missing),
+                    "对账结论": "已平账" if balanced else "待补齐",
+                    "到达状态": "已抵达" if balanced else "待补齐",
+                    "实际行数": str(actual),
+                    "交付次数": str(member.get("delivery_count", 0)),
+                    "发布编号": manifest_code,
+                    "窗口编号": window_code,
+                    "status": "已平账" if balanced else "待对账",
+                    "pending": not balanced,
+                    "abnormal": not balanced and actual > 0,
+                })
+            result = {
+                "window_code": window_code,
+                "expected_rows": expected,
+                "actual_rows": actual,
+                "missing_rows": missing,
+                "delivery_count": member.get("delivery_count", 0),
+                "arrival_status": "已抵达" if balanced else "待补齐",
+                "reconcile_code": recon_code,
+            }
+            member_results.append(result)
+            (arrived if balanced else waiting).append(window_code)
+
+        self._write_jsonl(
+            self._data_dir("events") / "reconcile_log.jsonl",
+            [{"action": "reconcile_manifest", "manifest_code": manifest_code,
+              "arrived": arrived, "waiting": waiting, "at": time.time()}],
+        )
+        return {
+            "ok": True,
+            "manifest_code": manifest_code,
+            "arrived_windows": arrived,
+            "waiting_windows": waiting,
+            "delivered_windows": arrived,
+            "pending_windows": waiting,
+            "members": member_results,
+            "message": f"已抵达 {len(arrived)} 窗，待补齐 {len(waiting)} 窗",
+        }
+
+    reconcile_group = reconcile_manifest
+
     def execute_reconciliation(self, recon_id: int) -> dict[str, Any]:
         """执行到达对账：核实传输批次应到与实到记录数的一致性，统计迟到与缺失条数。
 

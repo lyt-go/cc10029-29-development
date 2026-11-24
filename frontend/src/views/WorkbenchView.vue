@@ -37,6 +37,16 @@
       <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
 
+    <ReleaseBatchPanel
+      v-if="supportsBatchRelease"
+      :rows="rows"
+      :refresh-token="loadedAt"
+    />
+
+    <p v-if="batchGate" class="page-desc" data-testid="batch-gate">
+      抽取未完成的窗口会在整组提交时标记为「待补齐」，不会进入对外交付。
+    </p>
+
     <table class="data-table">
       <thead>
         <tr>
@@ -103,6 +113,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import ReleaseBatchPanel from '@/views/ReleaseBatchPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +126,11 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const loadedAt = ref(0)
+const supportsBatchRelease = computed(() => props.moduleKey === 'extract_window')
+const batchGate = computed(
+  () => props.moduleKey === 'release_manifest' || props.moduleKey === 'extract_window',
+)
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -182,6 +198,7 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    loadedAt.value = Date.now()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }

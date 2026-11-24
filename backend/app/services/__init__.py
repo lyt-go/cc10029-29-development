@@ -6,6 +6,7 @@ from app.services.source_register import SourceRegisterService
 from app.services.target_register import TargetRegisterService
 from app.services.field_contract import FieldContractService
 from app.services.extract_window import ExtractWindowService
+from app.services.release_manifest import ReleaseManifestService
 from app.services.transfer_batch import TransferBatchService
 from app.services.staging_area import StagingAreaService
 from app.services.checksum_verify import ChecksumVerifyService
@@ -26,6 +27,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "target_register": TargetRegisterService(),
     "field_contract": FieldContractService(),
     "extract_window": ExtractWindowService(),
+    "release_manifest": ReleaseManifestService(),
     "transfer_batch": TransferBatchService(),
     "staging_area": StagingAreaService(),
     "checksum_verify": ChecksumVerifyService(),

@@ -16,6 +16,7 @@ from app.services.base import DATA_ROOT
 from app.services.source_register import SourceRegisterService
 from app.services.target_register import TargetRegisterService
 from app.services.extract_window import ExtractWindowService
+from app.services.release_manifest import ReleaseManifestService
 from app.services.transfer_batch import TransferBatchService
 from app.services.staging_area import StagingAreaService
 from app.services.checksum_verify import ChecksumVerifyService
@@ -275,6 +276,199 @@ class TestChain8ArchiveAndReplay:
         assert result["status"] == "已销毁"
 
 
+class TestChain9GroupedRelease:
+    """链路9: 相邻窗口成组发布→传输→暂存→对账（共享发布清单）。
+
+    覆盖需求中的关键场景：一次提交三个相邻窗口、中间窗口部分失败、按原窗口
+    重试、已交付成员不重复写入，以及中断期间暂存与对账的已交付范围一致性。
+    """
+
+    @staticmethod
+    def _prepare_windows(counts=(10, 11, 12), source_code="SOUR-GROUP"):
+        sr_svc = SourceRegisterService()
+        entry = sr_svc.register_source({
+            "源端编号": source_code, "系统名称": "成组发布测试", "数据域": "订单域",
+            "记录格式": "JSON", "编码方式": "UTF-8", "日增量级": "10万",
+            "抽取方式": "增量抽取", "登记游标": "0",
+        })
+        sr_svc.confirm_register(entry["id"])
+        ew_svc = ExtractWindowService()
+        windows = []
+        for count in counts:
+            window = ew_svc.create_window(source_code, count=count)
+            ew_svc.execute_extract(window["id"], record_count=count)
+            windows.append(window)
+        return windows
+
+    def test_group_submit_three_adjacent_windows_all_delivered(self):
+        """一次提交整组三个相邻窗口，全部交付且各窗行数与交付次数正确。"""
+        windows = self._prepare_windows()
+        svc = ReleaseManifestService()
+
+        result = svc.submit_group(window_ids=[window["id"] for window in windows])
+
+        assert result["ok"] is True
+        assert result["status"] == "已交付"
+        assert result["delivered_windows"] == 3
+        assert result["pending_windows"] == 0
+        assert [member["window_code"] for member in result["members"]] == [
+            window["窗口编号"] for window in windows
+        ]
+        for member, expected in zip(result["members"], (10, 11, 12)):
+            assert member["expected_rows"] == expected
+            assert member["actual_rows"] == expected
+            assert member["arrival_status"] == "已抵达"
+            assert member["delivery_count"] == 1
+
+    def test_middle_window_partial_failure_then_retry(self):
+        """中间窗口写入部分完成后失败：前后窗已交付，重试只补中间窗且不重复写入。"""
+        windows = self._prepare_windows()
+        svc = ReleaseManifestService()
+        middle = windows[1]
+
+        first = svc.submit_group(
+            window_ids=[window["id"] for window in windows],
+            fail_window=middle["id"],
+            fail_after_rows=4,
+        )
+        assert first["status"] == "部分交付"
+        by_code = {member["window_code"]: member for member in first["members"]}
+        assert by_code[windows[0]["窗口编号"]]["delivery_status"] == "已交付"
+        assert by_code[windows[2]["窗口编号"]]["delivery_status"] == "已交付"
+        assert by_code[middle["窗口编号"]]["delivery_status"] == "待补齐"
+        assert by_code[middle["窗口编号"]]["actual_rows"] == 0
+        assert by_code[middle["窗口编号"]]["failure_position"] == 4
+        assert by_code[middle["窗口编号"]]["delivery_count"] == 0
+
+        # 中间窗口的抽取产物确实只写入了前 4 行
+        artifact = DATA_ROOT / "extracted" / f"{middle['窗口编号']}.jsonl"
+        assert len(ReleaseManifestService()._read_jsonl(artifact)) == 4
+
+        # 直接重试不会凭空补齐抽取，中间窗仍然待补齐
+        blocked = svc.retry(first["manifest_id"])
+        blocked_member = {
+            member["window_code"]: member for member in blocked["members"]
+        }[middle["窗口编号"]]
+        assert blocked_member["delivery_status"] == "待补齐"
+        assert blocked["status"] == "部分交付"
+
+        # 单独补上故障窗的数据后重试，整组交付完成
+        svc.supplement_window(first["manifest_id"], middle["id"])
+        second = svc.retry(first["manifest_id"])
+        assert second["status"] == "已交付"
+        assert second["skipped"] == [windows[0]["窗口编号"], windows[2]["窗口编号"]]
+        retried = {member["window_code"]: member for member in second["members"]}
+        for window, expected in zip(windows, (10, 11, 12)):
+            member = retried[window["窗口编号"]]
+            assert member["actual_rows"] == expected
+            assert member["delivery_count"] == 1
+            assert member["delivery_status"] == "已交付"
+        # 中间窗口的产品文件按行号续写，最终恰好 11 行，没有重复
+        records = ReleaseManifestService()._read_jsonl(
+            DATA_ROOT / "batches" / f"{retried[middle['窗口编号']]['transfer_batch']}.jsonl"
+        )
+        assert len(records) == 11
+        assert sorted(record["line_no"] for record in records) == list(range(1, 12))
+
+    def test_interrupted_scope_matches_between_staging_and_reconcile(self):
+        """中断第二窗后，暂存与对账的已交付范围一致，且与共享清单相同。"""
+        windows = self._prepare_windows()
+        svc = ReleaseManifestService()
+        result = svc.submit_group(
+            window_ids=[window["id"] for window in windows],
+            fail_window=windows[1]["id"],
+            fail_after_rows=5,
+        )
+        code = result["manifest_code"]
+
+        manifest_scope = svc.manifest_scope(code)
+        staging_scope = StagingAreaService().staging_scope(code)
+        reconcile = ArrivalReconcileService().reconcile_manifest(code)
+
+        expected_arrived = [windows[0]["窗口编号"], windows[2]["窗口编号"]]
+        expected_pending = [windows[1]["窗口编号"]]
+        assert manifest_scope["arrived_windows"] == expected_arrived
+        assert staging_scope["arrived_windows"] == expected_arrived
+        assert reconcile["arrived_windows"] == expected_arrived
+        assert manifest_scope["pending_windows"] == expected_pending
+        assert staging_scope["waiting_windows"] == expected_pending
+        assert reconcile["waiting_windows"] == expected_pending
+
+        middle_staging = next(
+            item for item in staging_scope["members"]
+            if item["window_code"] == windows[1]["窗口编号"]
+        )
+        assert middle_staging["staging_rows"] == 0
+        assert middle_staging["expected_rows"] == 11
+        assert middle_staging["arrival_status"] == "待补齐"
+
+    def test_supplement_then_resubmit_recovers_original_window(self):
+        """单独补齐故障窗后重新提交原申请，逐条核对实际行、到达状态与交付次数。"""
+        windows = self._prepare_windows()
+        svc = ReleaseManifestService()
+        first = svc.submit_group(
+            window_ids=[window["id"] for window in windows],
+            fail_window=windows[1]["id"],
+            fail_after_rows=3,
+        )
+        code = first["manifest_code"]
+
+        supplement = svc.supplement_window(first["manifest_id"], windows[1]["id"])
+        assert supplement["ok"] is True
+        assert supplement["supplement"]["existing_rows"] == 3
+        assert supplement["supplement"]["supplemented_rows"] == 8
+        assert supplement["extraction_ready"] is True
+
+        second = svc.retry(first["manifest_id"])
+        assert second["status"] == "已交付"
+        staging_scope = StagingAreaService().staging_scope(code)
+        reconcile = ArrivalReconcileService().reconcile_manifest(code)
+        assert reconcile["arrived_windows"] == [window["窗口编号"] for window in windows]
+
+        rows = {
+            member["window_code"]: member
+            for member in staging_scope["members"]
+        }
+        reconcile_rows = {
+            member["window_code"]: member
+            for member in reconcile["members"]
+        }
+        for window, expected in zip(windows, (10, 11, 12)):
+            staged = rows[window["窗口编号"]]
+            assert staged["staging_rows"] == expected
+            assert staged["arrival_status"] == "已抵达"
+            assert staged["delivery_count"] == 1
+            reconciled = reconcile_rows[window["窗口编号"]]
+            assert reconciled["expected_rows"] == expected
+            assert reconciled["actual_rows"] == expected
+            assert reconciled["missing_rows"] == 0
+            assert reconciled["delivery_count"] == 1
+
+    def test_non_adjacent_windows_rejected(self):
+        """跳过中间窗口的选择不构成相邻窗口，成组提交被拒绝。"""
+        windows = self._prepare_windows()
+        svc = ReleaseManifestService()
+        result = svc.submit_group(window_ids=[windows[0]["id"], windows[2]["id"]])
+        assert result["ok"] is False
+        assert "相邻" in result["message"]
+
+    def test_window_without_extraction_is_not_delivered(self):
+        """抽取未完成的窗口进入清单但不交付，标记为待补齐。"""
+        windows = self._prepare_windows()
+        ew_svc = ExtractWindowService()
+        # 新增一个尚未抽取的相邻窗口
+        pending = ew_svc.create_window("SOUR-GROUP", count=9)
+        svc = ReleaseManifestService()
+        result = svc.submit_group(window_ids=[window["id"] for window in windows] + [pending["id"]])
+
+        by_code = {member["window_code"]: member for member in result["members"]}
+        pending_member = by_code[pending["窗口编号"]]
+        assert pending_member["delivery_status"] == "待补齐"
+        assert pending_member["actual_rows"] == 0
+        assert pending_member["delivery_count"] == 0
+        assert pending["窗口编号"] in result["pending"]
+
+
 class TestCrossModuleSnapshot:
     """跨模块汇总验证：所有模块 domain_snapshot 可调用。"""
     MODULES = [
@@ -282,6 +476,7 @@ class TestCrossModuleSnapshot:
         ("target_register", TargetRegisterService),
         ("field_contract", FieldContractService),
         ("extract_window", ExtractWindowService),
+        ("release_manifest", ReleaseManifestService),
         ("transfer_batch", TransferBatchService),
         ("staging_area", StagingAreaService),
         ("checksum_verify", ChecksumVerifyService),

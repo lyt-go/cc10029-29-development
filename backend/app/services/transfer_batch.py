@@ -145,6 +145,43 @@ class TransferBatchService(BaseModuleService):
 
         return result
 
+    def transfer_scope(self, manifest_code: str) -> dict[str, Any]:
+        """按成组发布清单核对传输侧已写入范围，与暂存、对账共享同一份清单。"""
+        from app.services.release_manifest import ReleaseManifestService
+
+        manifest = ReleaseManifestService().get_manifest(manifest_code)
+        if manifest is None:
+            return {"error": f"发布清单 {manifest_code} 不存在", "message": "发布清单不存在"}
+        members = []
+        delivered, pending = [], []
+        for member in manifest.get("members", []):
+            batch_code = member.get("transfer_batch")
+            transferred = 0
+            if batch_code:
+                transferred = len(self._read_jsonl(self._data_dir("batches") / f"{batch_code}.jsonl"))
+            complete = (
+                member.get("delivery_status") == "已交付"
+                and transferred >= int(member.get("expected_rows") or 0)
+            )
+            members.append({
+                "window_code": member.get("window_code"),
+                "expected_rows": member.get("expected_rows", 0),
+                "transferred_rows": transferred,
+                "actual_rows": member.get("actual_rows", 0),
+                "delivery_count": member.get("delivery_count", 0),
+                "delivery_status": member.get("delivery_status"),
+                "arrival_status": member.get("arrival_status"),
+                "batch_code": batch_code,
+            })
+            (delivered if complete else pending).append(member.get("window_code"))
+        return {
+            "manifest_code": manifest_code,
+            "total_windows": len(members),
+            "delivered_windows": delivered,
+            "pending_windows": pending,
+            "members": members,
+        }
+
     def mark_completed(self, batch_id: int) -> dict[str, Any]:
         """标记传输批次已完成，写入完成事件日志并记录批次汇总统计。"""
         entry, msg = self.run_action(batch_id, "标记完成")

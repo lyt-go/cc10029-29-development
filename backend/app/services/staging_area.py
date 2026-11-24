@@ -82,6 +82,49 @@ class StagingAreaService(BaseModuleService):
             "artifact_path": str(output_file),
         }
 
+    def staging_scope(self, manifest_code: str) -> dict[str, Any]:
+        """按成组发布清单核对暂存侧已交付范围。
+
+        与传输、对账共享同一份发布清单：已交付窗口必须在暂存分区里找到与清单
+        行数一致的落地产物，否则视为尚待补齐。返回每个窗口的实际行与到达状态，
+        供值班人员中断后分别检查暂存与对账是否一致。
+        """
+        from app.services.release_manifest import ReleaseManifestService
+
+        manifest = ReleaseManifestService().get_manifest(manifest_code)
+        if manifest is None:
+            return {"error": f"发布清单 {manifest_code} 不存在", "message": "发布清单不存在"}
+        members = []
+        arrived, waiting = [], []
+        for member in manifest.get("members", []):
+            staging_code = member.get("staging_code")
+            staged_rows = 0
+            if staging_code:
+                staged_rows = len(self._read_jsonl(self._data_dir("staging") / f"{staging_code}.jsonl"))
+            manifest_rows = int(member.get("actual_rows") or 0)
+            delivered = member.get("delivery_status") == "已交付" and staged_rows >= int(member.get("expected_rows") or 0)
+            record = {
+                "window_code": member.get("window_code"),
+                "expected_rows": member.get("expected_rows", 0),
+                "staging_rows": staged_rows,
+                "manifest_rows": manifest_rows,
+                "delivery_status": member.get("delivery_status"),
+                "arrival_status": "已抵达" if delivered else member.get("arrival_status", "待补齐"),
+                "delivery_count": member.get("delivery_count", 0),
+                "staging_code": staging_code,
+            }
+            members.append(record)
+            (arrived if delivered else waiting).append(member.get("window_code"))
+        return {
+            "manifest_code": manifest_code,
+            "total_windows": len(members),
+            "arrived_windows": arrived,
+            "waiting_windows": waiting,
+            "delivered_windows": arrived,
+            "pending_windows": waiting,
+            "members": members,
+        }
+
     def confirm_land(self, staging_id: int) -> dict[str, Any]:
         """确认暂存分区落地完成，校验落地产物数据完整性并写入落地确认日志。"""
         entry, msg = self.run_action(staging_id, "确认落地")

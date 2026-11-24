@@ -68,6 +68,34 @@ npm run dev
 | 历史重放 | `exchange_replay` | 重放任务 | 重放编号、归档编号、重放范围 |
 | 时效监控 | `sla_monitor` | 时效指标 | 指标编号、源端编号、约定到达时限 |
 | 通道配置 | `channel_config` | 传输通道 | 通道编号、传输协议、并发连接数 |
+| 成组发布 | `release_manifest` | 成组发布清单 | 发布编号、窗口范围、已交付窗口数 |
+
+## 多窗口成组发布
+
+增量窗口支持多选相邻窗口，一次提交整组：
+
+1. 在「增量窗口」工作台上勾选同一源端的相邻窗口，可先「完成所选窗口抽取」。
+2. 点「提交整组」后，后端创建一份成组批次发布清单（`release_manifest`），
+   按窗口逐个写入传输产物和暂存产物，并登记每个窗口的实际行数、到达状态与
+   交付次数。抽取未完成的窗口进入清单但标记为「待补齐」，不对外交付。
+3. 清单同时落盘到 `data/releases/<发布编号>.json`，作为传输、暂存、对账共享的
+   唯一事实来源：传输侧按成员逐窗写入，暂存与对账据清单区分「已抵达窗口」与
+   「待补齐窗口」。
+4. 中途失败时，已交付成员在重试中直接跳过、不会重复写入；失败窗口可从原窗口
+   水位续写。需要时先「单独补数」恢复故障窗，再重新提交原申请。
+
+相关接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/release/windows` | 为同一源端连续创建相邻窗口，可选立即抽取 |
+| `POST /api/release/windows/{id}/extract` | 执行单个窗口抽取 |
+| `POST /api/release/windows/{id}/supplement` | 单独补齐故障窗口数据 |
+| `POST /api/release/submit` | 一次提交整组相邻窗口 |
+| `POST /api/release/manifests/{id}/retry` | 按原申请重试整组任务 |
+| `POST /api/release/manifests/{id}/supplement` | 按发布清单单独补数 |
+| `GET /api/release/manifests/{id}` | 清单详情（逐窗实际行、到达状态、交付次数） |
+| `GET /api/release/scope/{发布编号}` | 传输/暂存/对账共享的已抵达与待补齐范围 |
 
 ## 约定
 
